@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+import argparse
+import socket
+import ssl
+import sys
+import html
+import re
+from html.parser import HTMLParser
+import urllib.parse
+import time
+
+# Record the start time
+# start_time = time.time()
+
+DEFAULT_SERVER = "proj5.3700.network"
+DEFAULT_PORT = 443
+
+crawled_pages = set()
+all_pages = []
+flags = []
+
+class Parser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.csrfmiddlewaretoken = None
+        self.inside_h3 = False 
+        self.flag_prefix = "FLAG: "
+
+    #Parsing the HTML tags
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+        
+        #extracting the csrfmiddlewaretoken
+        if tag == "input":
+            if attrs_dict.get("name") == "csrfmiddlewaretoken":
+                self.csrfmiddlewaretoken = attrs_dict.get("value")
+                    
+        #extracting the URL links in fakebook e.g. /fakebook/753533313/ to visit           
+        elif tag == "a" and 'href' in attrs_dict and 'fakebook' in attrs_dict['href']:
+            if attrs_dict['href'] not in crawled_pages:
+                all_pages.append(attrs_dict['href'])
+        
+        #entering an <h3> tag that has the secret flag
+        elif tag == "h3":
+            self.inside_h3 = True 
+    
+    #Parsing the HTML data to get the flags
+    def handle_data(self, data):
+        if self.inside_h3 and data.startswith(self.flag_prefix):
+            flag = data[len(self.flag_prefix):].strip()
+            flags.append(flag)
+                    
+class Crawler:
+    def __init__(self, args):
+        self.server = args.server
+        self.port = args.port
+        self.username = args.username
+        self.password = args.password
+        
+    #connect to socket using tls
+    def connect_socket(self):
+        mysocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM) #tcp connection 
+        # context = ssl.create_default_context()
+        mysocket = ssl.wrap_socket(mysocket, ssl_version=ssl.PROTOCOL_TLSv1_2)
+        # mysocket = context.wrap_socket(mysocket, server_hostname = self.server)
+        mysocket.connect((self.server, self.port))
+        return mysocket
+
+    #send get message and receiving a response from the server
+    def get_request(self, request):
+        self.socket.send(request.encode('ascii'))
+        response = self.socket.recv(4096).decode("ascii")
+        while "</html>" not in response and "302 Found" not in response:
+            response += self.socket.recv(4096).decode("ascii")
+        #print(response)
+        return response
+      
+    #send post message and receiving a response from the server  
+    def post_request(self, post_request):
+        self.socket.send(post_request.encode('ascii'))
+        response = self.socket.recv(4096).decode("ascii")
+        while "</html>" not in response and "302 Found" not in response:
+            response += self.socket.recv(4096).decode("ascii")
+        #print(response)
+        return response
+
+    #extracting the csrftoken and sessionid from the server response
+    def extract_cookies(self, get_received):
+        lines = get_received.split("\n")
+        cookies = {}
+        for line in lines:
+            if line.startswith("set-cookie:"):
+                cookie = line.split(":", 1)[1].strip()
+                cookie_parts = cookie.split("=", 1)
+                if len(cookie_parts)==2:
+                    cookie_name, cookie_value = cookie_parts
+                    cookie_value = cookie_value.split(";", 1)[0]
+                    cookies[cookie_name.strip()] = cookie_value.strip()
+        return cookies
+    
+    def run(self): 
+        #Connect to socket
+        self.socket = self.connect_socket()
+        
+        get_request = "GET " + "/accounts/login/?next=/fakebook/" + " HTTP/1.1\r\nHost: " + self.server + ":" + str(self.port) + "\r\n\r\n" 
+        get_received = self.get_request(get_request)
+        
+        #Extract the cookies (csrf_token and sessionid)
+        cookies = self.extract_cookies(get_received)
+        csrf_token = cookies.get('csrftoken', '')
+        session_id = cookies.get('sessionid', '')
+        
+        #HTMLParser looks for the csrfmiddlewaretoken in the HTML part of the HTTP response
+        parser = Parser()
+        parser.feed(get_received)
+        csrf_middleware_token = parser.csrfmiddlewaretoken
+        
+        #POST message to login to Fakebook with the details, need to connect socket again
+        self.socket = self.connect_socket()
+        content = "username=" + self.username + "&password=" + self.password + "&csrfmiddlewaretoken=" + csrf_middleware_token + "&next=/fakebook/"
+        post = "POST /accounts/login/ HTTP/1.1\r\nHost: " + self.server + "\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + str(len(content)) + "\r\nCookie: csrftoken=" + csrf_token + "; sessionid=" + session_id +  "\r\nConnection: keep-alive\r\n\r\n" + content + "\r\n\r\n"
+        post_received = self.post_request(post)
+        
+        #New get request using updated cookies
+        cookies = self.extract_cookies(post_received)
+        csrf_token = cookies.get('csrftoken', '')
+        session_id = cookies.get('sessionid', '')
+
+        second_get = "GET /fakebook/ HTTP/1.1\r\nHost: " + self.server + "\r\nCookie: csrftoken=" + csrf_token + "; sessionid=" +  session_id + "\r\nConnection: keep-alive" + "\r\n\r\n" 
+        second_get_received = self.get_request(second_get)  
+        parser.feed(second_get_received)
+        
+        #crawling through the links
+        while all_pages:
+            next_page = all_pages.pop(0) #get the next URL to visit
+            #print(next_page)
+            if next_page not in crawled_pages: #ensures it has not been visited
+                crawl_request = "GET " + next_page + " HTTP/1.1\r\nHost: " + self.server + "\r\nCookie: csrftoken=" + csrf_token + "; sessionid=" +  session_id + "\r\nConnection: keep-alive" + "\r\n\r\n" 
+                response = self.get_request(crawl_request)
+                parser.feed(response) 
+                
+                #mark this url as visited
+                crawled_pages.add(next_page)
+                # print(next_page)
+
+                #once we reach 5 flags
+                if len(flags) == 5:
+                    break
+    
+        #once everything is done print it out
+        for flag in flags:
+            print(flag)
+            
+        # end_time = time.time()
+
+        # Calculate the time difference
+        # time_difference = end_time - start_time
+        
+        # print("Time difference:", time_difference, "seconds")
+        
+        
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='crawl Fakebook')
+    parser.add_argument('-s', dest="server", type=str, default=DEFAULT_SERVER, help="The server to crawl")
+    parser.add_argument('-p', dest="port", type=int, default=DEFAULT_PORT, help="The port to use")
+    parser.add_argument('username', type=str, help="The username to use")
+    parser.add_argument('password', type=str, help="The password to use")
+    args = parser.parse_args()
+    sender = Crawler(args)
+    sender.run()
